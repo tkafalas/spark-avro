@@ -16,15 +16,14 @@
 package com.databricks.spark.avro
 
 import java.nio.ByteBuffer
+import java.sql.{Date, Timestamp}
 
 import scala.collection.JavaConverters._
-
 import org.apache.avro.generic.GenericFixed
 import org.apache.avro.generic.{GenericData, GenericRecord}
 import org.apache.avro.{Schema, SchemaBuilder}
 import org.apache.avro.SchemaBuilder._
 import org.apache.avro.Schema.Type._
-
 import org.apache.spark.sql.catalyst.expressions.GenericRow
 import org.apache.spark.sql.types._
 
@@ -33,6 +32,12 @@ import org.apache.spark.sql.types._
  * versa.
  */
 object SchemaConverters {
+  val LOGICAL_TYPE = "logicalType"
+  val DATE = "date"
+  val TIME_MILLIS = "time-millis"
+  val PRECISION = "precision"
+  val SCALE = "scale"
+  val DECIMAL = "decimal"
 
   class IncompatibleSchemaException(msg: String, ex: Throwable = null) extends Exception(msg, ex)
 
@@ -44,12 +49,29 @@ object SchemaConverters {
   def toSqlType(avroSchema: Schema): SchemaType = {
     avroSchema.getType match {
       case INT => SchemaType(IntegerType, nullable = false)
-      case STRING => SchemaType(StringType, nullable = false)
+      case STRING => {
+        val logicalType = avroSchema.getJsonProp(LOGICAL_TYPE)
+        if (logicalType != null && logicalType.asText().equalsIgnoreCase(DECIMAL)) {
+          val precision = avroSchema.getJsonProp(PRECISION).asInt
+          val scale = avroSchema.getJsonProp(SCALE).asInt
+          SchemaType(DecimalType(precision, scale), nullable = false)
+        } else {
+          SchemaType(StringType, nullable = false)
+        }
+      }
+
       case BOOLEAN => SchemaType(BooleanType, nullable = false)
       case BYTES => SchemaType(BinaryType, nullable = false)
       case DOUBLE => SchemaType(DoubleType, nullable = false)
       case FLOAT => SchemaType(FloatType, nullable = false)
-      case LONG => SchemaType(LongType, nullable = false)
+      case LONG =>  {
+        val logicalType = avroSchema.getJsonProp(LOGICAL_TYPE)
+        if (logicalType != null && ( logicalType.asText().equalsIgnoreCase(TIME_MILLIS) || logicalType.asText().equalsIgnoreCase(DATE) ) )   {
+          SchemaType(TimestampType, nullable = false)
+        } else {
+          SchemaType(LongType, nullable = false)
+        }
+      }
       case FIXED => SchemaType(BinaryType, nullable = false)
       case ENUM => SchemaType(StringType, nullable = false)
 
@@ -148,6 +170,23 @@ object SchemaConverters {
         // Avro strings are in Utf8, so we have to call toString on them
         case (StringType, STRING) | (StringType, ENUM) =>
           (item: AnyRef) => if (item == null) null else item.toString
+        //case (DecimalType, STRING) => GOES HERE BUT DecimalType is not a DataType for some reason
+        case (TimestampType, LONG) =>
+          (item: AnyRef) =>
+            if (item == null) {
+              null
+            } else {
+              new Timestamp( item.asInstanceOf[Long].longValue() )
+             // new Timestamp(item.asInstanceOf[Long].longValue())
+            }
+        case (DateType, LONG) =>
+          (item: AnyRef) =>
+            if (item == null) {
+              null
+            } else {
+              new Date(item.asInstanceOf[Long].longValue())
+            }
+
         // Byte arrays are reused by avro, so we have to make a copy of them.
         case (IntegerType, INT) | (BooleanType, BOOLEAN) | (DoubleType, DOUBLE) |
              (FloatType, FLOAT) | (LongType, LONG) =>
@@ -371,9 +410,10 @@ object SchemaConverters {
       case StringType => newFieldBuilder.stringType()
       case BinaryType => newFieldBuilder.bytesType()
       case BooleanType => newFieldBuilder.booleanType()
-      case TimestampType => newFieldBuilder.longType()
-      case DateType => newFieldBuilder.longType()
-
+      case TimestampType => //newFieldBuilder.longType()
+        newFieldBuilder.longBuilder().prop(LOGICAL_TYPE, TIME_MILLIS).endLong()
+      case DateType => //newFieldBuilder.longType()
+        newFieldBuilder.longBuilder().prop(LOGICAL_TYPE, DATE).endLong()
       case ArrayType(elementType, _) =>
         val builder = getSchemaBuilder(dataType.asInstanceOf[ArrayType].containsNull)
         val elementSchema = convertTypeToAvro(
